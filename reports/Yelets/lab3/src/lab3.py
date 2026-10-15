@@ -3,12 +3,15 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")  
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (mean_absolute_error, mean_squared_error,
                              r2_score, f1_score, accuracy_score,
-                             confusion_matrix)
+                             confusion_matrix, ConfusionMatrixDisplay)
 import ucimlrepo
 
 CFG = {
@@ -63,7 +66,6 @@ def pretrain(X, layer_sizes):
     for i in range(n_layers):
         in_dim = layer_sizes[i]
         out_dim = layer_sizes[i + 1]
-
         autoenc = AEModel(in_dim, out_dim).to(DEVICE)
         optimizer = torch.optim.Adam(autoenc.parameters(), lr=CFG["lr"])
 
@@ -87,7 +89,6 @@ def pretrain(X, layer_sizes):
 
 def make_net(input_dim, output_dim, weights=None):
     model = MLPModel(input_dim, output_dim).to(DEVICE)
-
     if weights is None:
         return model
 
@@ -99,8 +100,10 @@ def make_net(input_dim, output_dim, weights=None):
 
 def train(model, X, y, task, epochs):
     optimizer = torch.optim.Adam(model.parameters(), lr=CFG["lr"])
-
+    history = []
     for _ in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
         for x_batch, y_batch in get_batches(X, y):
             output = model(x_batch)
 
@@ -115,6 +118,12 @@ def train(model, X, y, task, epochs):
             loss.backward()
             optimizer.step()
 
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        history.append(epoch_loss / n_batches)
+    return history
+
 def set_requires_grad(module, value):
     for p in module.parameters():
         p.requires_grad = value
@@ -124,16 +133,30 @@ def train_pretrained(model, X, y, task):
     head = linear_layers[-1]
     set_requires_grad(model, False)
     set_requires_grad(head, True)
-    train(model, X, y, task, CFG["epochs_head"])
+    hist_head = train(model, X, y, task, CFG["epochs_head"])
     set_requires_grad(model, True)
-    train(model, X, y, task, CFG["epochs_full"])
+    hist_full = train(model, X, y, task, CFG["epochs_full"])
+    return hist_head + hist_full
 
 def predict(model, X):
     with torch.no_grad():
         x = torch.tensor(X, dtype=torch.float32).to(DEVICE)
         return model(x).cpu().numpy()
 
-def report_classification(yte, pred, title):
+def plot_loss(history_base, history_pre, title, fname):
+    plt.figure(figsize=(10, 5))
+    plt.plot(history_base, label="Без предобучения", linewidth=2)
+    plt.plot(history_pre, label="С предобучением", linewidth=2)
+    plt.xlabel("Эпоха")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(fname, dpi=150)
+    plt.close()
+
+def report_classification(yte, pred, title, labels=None):
     print(f"{title}:")
     print(f"Accuracy: {accuracy_score(yte, pred):.4f}")
     print(f"F1 (macro): {f1_score(yte, pred, average='macro', zero_division=0):.4f}")
@@ -141,6 +164,20 @@ def report_classification(yte, pred, title):
     print("Confusion matrix:")
     print(confusion_matrix(yte, pred))
     print()
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ConfusionMatrixDisplay.from_predictions(
+        yte, pred,
+        display_labels=labels,
+        cmap="Blues",
+        ax=ax,
+        colorbar=True,
+    )
+    ax.set_title(f"Confusion matrix - {title}")
+    plt.tight_layout()
+    fname = f"confusion_{title.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
 
 def report_regression(yte, pred, title):
     mae = mean_absolute_error(yte, pred)
@@ -184,17 +221,22 @@ def run_quality():
 
     input_dim = Xtr.shape[1]
     model_base = make_net(input_dim, n_classes)
-    train(model_base, Xtr, ytr, "cls", CFG["epochs_full"])
+    hist_base = train(model_base, Xtr, ytr, "cls", CFG["epochs_full"])
     pred_base = predict(model_base, Xte).argmax(1)
 
     weights = pretrain(Xtr, [input_dim] + list(CFG["hidden"]))
     model_pre = make_net(input_dim, n_classes, weights)
-    train_pretrained(model_pre, Xtr, ytr, "cls")
+    hist_pre = train_pretrained(model_pre, Xtr, ytr, "cls")
     pred_pre = predict(model_pre, Xte).argmax(1)
 
     print("\nРезультаты:")
-    report_classification(yte, pred_base, "Без предобучения")
-    report_classification(yte, pred_pre, "С предобучением")
+    class_labels = [f"quality={c}" for c in classes]
+    report_classification(yte, pred_base, "Без предобучения", labels=class_labels)
+    report_classification(yte, pred_pre, "С предобучением", labels=class_labels)
+
+    plot_loss(hist_base, hist_pre,
+              "Wine Quality - Loss по эпохам",
+              "wine_quality_loss.png")
 
 def run_thermo():
     print("Датасет Infrared Thermography")
@@ -251,7 +293,7 @@ def run_thermo():
 
     input_dim = Xtr.shape[1]
     model_base = make_net(input_dim, 1)
-    train(model_base, Xtr, ytr_scaled, "reg", CFG["epochs_full"])
+    hist_base = train(model_base, Xtr, ytr_scaled, "reg", CFG["epochs_full"])
     pred_base = predict(model_base, Xte).ravel()
     pred_base = target_scaler.inverse_transform(
         pred_base.reshape(-1, 1)
@@ -259,7 +301,7 @@ def run_thermo():
 
     weights = pretrain(Xtr, [input_dim] + list(CFG["hidden"]))
     model_pre = make_net(input_dim, 1, weights)
-    train_pretrained(model_pre, Xtr, ytr_scaled, "reg")
+    hist_pre = train_pretrained(model_pre, Xtr, ytr_scaled, "reg")
     pred_pre = predict(model_pre, Xte).ravel()
     pred_pre = target_scaler.inverse_transform(
         pred_pre.reshape(-1, 1)
@@ -268,6 +310,10 @@ def run_thermo():
     print("\nРезультаты:")
     report_regression(yte, pred_base, "Без предобучения")
     report_regression(yte, pred_pre, "С предобучением")
+
+    plot_loss(hist_base, hist_pre,
+              "Infrared Thermography - Loss по эпохам",
+              "thermo_loss.png")
 
 if __name__ == "__main__":
     run_quality()
